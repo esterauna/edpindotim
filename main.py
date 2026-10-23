@@ -22,7 +22,7 @@ GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
 # --- MySQL connection ---
 DB_HOST = os.environ.get("DB_HOST")
-DB_PORT = int(os.environ.get("DB_PORT"))
+DB_PORT = os.environ.get("DB_PORT")
 DB_USERNAME = os.environ.get("DB_USERNAME")
 DB_DATABASE = os.environ.get("DB_DATABASE")
 DB_PASSWORD = os.environ.get("DB_PASSWORD")
