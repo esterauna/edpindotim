@@ -21,11 +21,11 @@ TOKEN_URL = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
 # --- MySQL connection ---
-DB_HOST = os.environ.get("DB_HOST", "srv1092.hstgr.io")
-DB_PORT = int(os.environ.get("DB_PORT", "3306"))
-DB_USERNAME = os.environ.get("DB_USERNAME", "u525350507_root")
-DB_DATABASE = os.environ.get("DB_DATABASE", "u525350507_bali_dwipa")
-DB_PASSWORD = os.environ.get("DB_PASSWORD", "Ramikha81__")
+DB_HOST = os.environ.get("DB_HOST")
+DB_PORT = int(os.environ.get("DB_PORT"))
+DB_USERNAME = os.environ.get("DB_USERNAME")
+DB_DATABASE = os.environ.get("DB_DATABASE")
+DB_PASSWORD = os.environ.get("DB_PASSWORD")
 
 FOLDER_PATH = os.environ.get(
     "STT_FOLDER_PATH", "EDP/SOURCE/CLEAN/STT WEEK/REGION/BALI"
