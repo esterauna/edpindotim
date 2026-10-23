@@ -2,6 +2,7 @@ import os
 import re
 import time
 import io
+import logging
 import traceback
 
 import httpx
@@ -10,11 +11,9 @@ import pymysql
 from fastapi import FastAPI, HTTPException
 
 app = FastAPI()
-
-import logging
 logger = logging.getLogger("stt")
 
-# --- Config (from environment variables — set these in Railway) ---
+# --- Microsoft Graph config (set these in Railway) ---
 CLIENT_ID = os.environ["MS_CLIENT_ID"]
 CLIENT_SECRET = os.environ["MS_CLIENT_SECRET"]
 TENANT_ID = os.environ["MS_TENANT_ID"]
@@ -23,7 +22,7 @@ SITE_ID = os.environ["MS_SITE_ID"]
 TOKEN_URL = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
-# --- MySQL connection ---
+# --- MySQL config (set these in Railway) ---
 DB_HOST = os.environ["DB_HOST"]
 DB_PORT = int(os.environ.get("DB_PORT", "3306"))
 DB_USERNAME = os.environ["DB_USERNAME"]
@@ -34,6 +33,8 @@ FOLDER_PATH = os.environ.get(
     "STT_FOLDER_PATH", "EDP/SOURCE/CLEAN/STT WEEK/REGION/BALI"
 )
 FILENAME_PATTERN = re.compile(r"STT_(\d{4})_W(\d{1,2})", re.IGNORECASE)
+
+CHUNK_SIZE = 500
 
 # Excel header -> DB column
 COLUMN_MAP = {
@@ -83,8 +84,12 @@ async def root():
 
 @app.get("/version-check")
 async def version_check():
-    return {"marker": "sanitized-v2"}
+    return {"marker": "sanitized-v3"}
 
+
+# ---------------------------------------------------------------
+# Microsoft Graph
+# ---------------------------------------------------------------
 
 async def get_access_token() -> str:
     if _token_cache["access_token"] and time.time() < _token_cache["expires_at"] - 60:
@@ -102,7 +107,8 @@ async def get_access_token() -> str:
         )
 
     if resp.status_code != 200:
-        raise HTTPException(status_code=500, detail=f"Token fetch failed: {resp.text}")
+        logger.error("Token fetch failed: %s", resp.text)
+        raise HTTPException(status_code=500, detail="Token fetch failed")
 
     data = resp.json()
     _token_cache["access_token"] = data["access_token"]
@@ -149,6 +155,10 @@ async def fetch_and_parse(item_id: str) -> pd.DataFrame:
     return df
 
 
+# ---------------------------------------------------------------
+# MySQL
+# ---------------------------------------------------------------
+
 def get_db_connection():
     return pymysql.connect(
         host=DB_HOST,
@@ -158,9 +168,12 @@ def get_db_connection():
         database=DB_DATABASE,
         charset="utf8mb4",
         connect_timeout=10,
+        read_timeout=300,
+        write_timeout=300,
     )
 
-def upsert_rows(conn, df: pd.DataFrame, report_year: int, report_week: int):
+
+def upsert_rows(conn, df: pd.DataFrame, report_year: int, report_week: int) -> int:
     df = df.copy()
     df["report_year"] = report_year
     df["report_week"] = report_week
@@ -192,11 +205,16 @@ def upsert_rows(conn, df: pd.DataFrame, report_year: int, report_week: int):
     rows = [tuple(r) for r in df.itertuples(index=False, name=None)]
 
     with conn.cursor() as cursor:
-        cursor.executemany(sql, rows)
-    conn.commit()
+        for i in range(0, len(rows), CHUNK_SIZE):
+            cursor.executemany(sql, rows[i:i + CHUNK_SIZE])
+            conn.commit()
 
     return len(rows)
 
+
+# ---------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------
 
 @app.post("/sync/stt-reports")
 async def sync_stt_reports(limit: int | None = None):
@@ -206,28 +224,80 @@ async def sync_stt_reports(limit: int | None = None):
         files = files[:limit]
 
     results = []
+    for f in files:
+        try:
+            df = await fetch_and_parse(f["item_id"])
+            conn = get_db_connection()
+            try:
+                inserted = upsert_rows(conn, df, f["report_year"], f["report_week"])
+            finally:
+                conn.close()
+            results.append({
+                "file": f["name"],
+                "report_year": f["report_year"],
+                "report_week": f["report_week"],
+                "rows": inserted,
+                "status": "success",
+            })
+        except Exception as e:
+            logger.exception("Failed to sync %s", f["name"])
+            results.append({"file": f["name"], "status": "error", "error": str(e)})
+
+    return {"files_found": len(files), "results": results}
+
+
+@app.post("/sync/stt-reports/week")
+async def sync_stt_specific_week(year: int, week: int):
+    if week < 1 or week > 53:
+        raise HTTPException(status_code=400, detail="Week must be between 1 and 53")
+
+    files = await list_stt_files()
+    target_file = next(
+        (f for f in files if f["report_year"] == year and f["report_week"] == week),
+        None,
+    )
+    if not target_file:
+        raise HTTPException(
+            status_code=404,
+            detail=f"STT file for {year} week {week} was not found",
+        )
+
+    try:
+        df = await fetch_and_parse(target_file["item_id"])
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Failed to read STT %s W%s", year, week)
+        raise HTTPException(
+            status_code=500,
+            detail={"message": f"Failed to read STT {year} W{week}", "error": str(e)},
+        )
+
     try:
         conn = get_db_connection()
     except Exception as e:
         logger.exception("DB connection failed")
-        raise HTTPException(status_code=503, detail={"message": "Database connection failed", "error": str(e)})
+        raise HTTPException(
+            status_code=503,
+            detail={"message": "Database connection failed", "error": str(e)},
+        )
 
     try:
-        for f in files:
-            try:
-                df = await fetch_and_parse(f["item_id"])
-                inserted = upsert_rows(conn, df, f["report_year"], f["report_week"])
-                results.append({
-                    "file": f["name"],
-                    "report_year": f["report_year"],
-                    "report_week": f["report_week"],
-                    "rows": inserted,
-                    "status": "success",
-                })
-            except Exception as e:
-                logger.exception("Failed to sync %s", f["name"])
-                results.append({"file": f["name"], "status": "error", "error": str(e)})
-        return {"files_found": len(files), "results": results}
+        inserted = upsert_rows(conn, df, year, week)
+        return {
+            "status": "ok",
+            "message": f"STT {year} W{week} successfully synced",
+            "file": target_file["name"],
+            "report_year": year,
+            "report_week": week,
+            "rows": inserted,
+        }
+    except Exception as e:
+        logger.exception("Failed to sync STT %s W%s", year, week)
+        raise HTTPException(
+            status_code=500,
+            detail={"message": f"Failed to sync STT {year} W{week}", "error": str(e)},
+        )
     finally:
         conn.close()
 
@@ -276,9 +346,7 @@ async def sharepoint_excel_debug(item_id: str):
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
 
-    content = io.BytesIO(resp.content)
-    xls = pd.ExcelFile(content)
-
+    xls = pd.ExcelFile(io.BytesIO(resp.content))
     df_raw = pd.read_excel(xls, sheet_name="Stock", header=None, nrows=10)
     df_raw = df_raw.where(pd.notnull(df_raw), None)
 
@@ -286,48 +354,3 @@ async def sharepoint_excel_debug(item_id: str):
         "sheet_names": xls.sheet_names,
         "first_10_rows": df_raw.values.tolist(),
     }
-
-
-@app.post("/sync/stt-reports/week")
-async def sync_stt_specific_week(year: int, week: int):
-    if week < 1 or week > 53:
-        raise HTTPException(status_code=400, detail="Week must be between 1 and 53")
-
-    files = await list_stt_files()
-    target_file = next(
-        (f for f in files if f["report_year"] == year and f["report_week"] == week),
-        None,
-    )
-    if not target_file:
-        raise HTTPException(
-            status_code=404,
-            detail=f"STT file for {year} week {week} was not found",
-        )
-
-    try:
-        conn = get_db_connection()
-    except Exception as e:
-        logger.exception("DB connection failed")
-        raise HTTPException(status_code=503, detail={"message": "Database connection failed", "error": str(e)})
-
-    try:
-        df = await fetch_and_parse(target_file["item_id"])
-        inserted = upsert_rows(conn, df, year, week)
-        return {
-            "status": "ok",
-            "message": f"STT {year} W{week} successfully synced",
-            "file": target_file["name"],
-            "report_year": year,
-            "report_week": week,
-            "rows": inserted,
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("Failed to sync STT %s W%s", year, week)
-        raise HTTPException(
-            status_code=500,
-            detail={"message": f"Failed to sync STT {year} W{week}", "error": str(e)},
-        )
-    finally:
-        conn.close()
