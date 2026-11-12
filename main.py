@@ -3,7 +3,6 @@ import re
 import time
 import io
 import logging
-import traceback
 
 import httpx
 import pandas as pd
@@ -84,7 +83,7 @@ async def root():
 
 @app.get("/version-check")
 async def version_check():
-    return {"marker": "sanitized-v3"}
+    return {"marker": "sanitized-v4-replace-week"}
 
 
 # ---------------------------------------------------------------
@@ -170,10 +169,26 @@ def get_db_connection():
         connect_timeout=10,
         read_timeout=300,
         write_timeout=300,
+        autocommit=False,  # we control the transaction ourselves
     )
 
 
-def upsert_rows(conn, df: pd.DataFrame, report_year: int, report_week: int) -> int:
+def replace_week_rows(conn, df: pd.DataFrame, report_year: int, report_week: int) -> dict:
+    """
+    Replace a whole report week.
+
+    1. Delete every existing row for (report_year, report_week).
+    2. Insert the rows from the new file.
+
+    Both steps run in ONE transaction: if the insert fails, the delete is
+    rolled back and the previous data for that week stays untouched.
+    """
+    if df.empty:
+        # Never wipe a week because of an empty / unreadable file.
+        raise ValueError(
+            f"File for {report_year} W{report_week} has no rows; existing data was NOT deleted"
+        )
+
     df = df.copy()
     df["report_year"] = report_year
     df["report_week"] = report_week
@@ -190,13 +205,16 @@ def upsert_rows(conn, df: pd.DataFrame, report_year: int, report_week: int) -> i
     cols = df.columns.tolist()
     col_list = ", ".join(f"`{c}`" for c in cols)
     placeholders = ", ".join(["%s"] * len(cols))
+
+    # After the delete the week is empty, so this only matters if the SAME
+    # file contains duplicate keys (last duplicate wins, like before).
     update_clause = ", ".join(
         f"`{c}` = VALUES(`{c}`)"
         for c in cols
         if c not in ("report_year", "report_week", "kode_customer", "kode_material")
     )
 
-    sql = f"""
+    insert_sql = f"""
         INSERT INTO stt_report_rows ({col_list})
         VALUES ({placeholders})
         ON DUPLICATE KEY UPDATE {update_clause}
@@ -204,12 +222,23 @@ def upsert_rows(conn, df: pd.DataFrame, report_year: int, report_week: int) -> i
 
     rows = [tuple(r) for r in df.itertuples(index=False, name=None)]
 
-    with conn.cursor() as cursor:
-        for i in range(0, len(rows), CHUNK_SIZE):
-            cursor.executemany(sql, rows[i:i + CHUNK_SIZE])
-            conn.commit()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM stt_report_rows WHERE report_year = %s AND report_week = %s",
+                (report_year, report_week),
+            )
+            deleted = cursor.rowcount
 
-    return len(rows)
+            for i in range(0, len(rows), CHUNK_SIZE):
+                cursor.executemany(insert_sql, rows[i:i + CHUNK_SIZE])
+
+        conn.commit()  # delete + insert become permanent together
+    except Exception:
+        conn.rollback()  # old week data comes back untouched
+        raise
+
+    return {"deleted": deleted, "inserted": len(rows)}
 
 
 # ---------------------------------------------------------------
@@ -218,7 +247,10 @@ def upsert_rows(conn, df: pd.DataFrame, report_year: int, report_week: int) -> i
 
 @app.post("/sync/stt-reports")
 async def sync_stt_reports(limit: int | None = None):
-    """Sync all STT files found in the SharePoint folder (or the first `limit` of them)."""
+    """
+    Sync all STT files found in the SharePoint folder (or the first `limit` of them).
+    Each file replaces its own year/week.
+    """
     files = await list_stt_files()
     if limit is not None:
         files = files[:limit]
@@ -229,14 +261,15 @@ async def sync_stt_reports(limit: int | None = None):
             df = await fetch_and_parse(f["item_id"])
             conn = get_db_connection()
             try:
-                inserted = upsert_rows(conn, df, f["report_year"], f["report_week"])
+                counts = replace_week_rows(conn, df, f["report_year"], f["report_week"])
             finally:
                 conn.close()
             results.append({
                 "file": f["name"],
                 "report_year": f["report_year"],
                 "report_week": f["report_week"],
-                "rows": inserted,
+                "deleted_rows": counts["deleted"],
+                "rows": counts["inserted"],
                 "status": "success",
             })
         except Exception as e:
@@ -283,14 +316,18 @@ async def sync_stt_specific_week(year: int, week: int):
         )
 
     try:
-        inserted = upsert_rows(conn, df, year, week)
+        counts = replace_week_rows(conn, df, year, week)
         return {
             "status": "ok",
-            "message": f"STT {year} W{week} successfully synced",
+            "message": (
+                f"STT {year} W{week} replaced: "
+                f"{counts['deleted']} old rows deleted, {counts['inserted']} new rows inserted"
+            ),
             "file": target_file["name"],
             "report_year": year,
             "report_week": week,
-            "rows": inserted,
+            "deleted_rows": counts["deleted"],
+            "rows": counts["inserted"],
         }
     except Exception as e:
         logger.exception("Failed to sync STT %s W%s", year, week)
