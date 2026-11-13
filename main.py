@@ -363,7 +363,7 @@ async def sharepoint_excel(item_id: str):
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
 
-    df = pd.read_excel(io.BytesIO(resp.content), sheet_name="Stock")
+    df = pd.read_excel(io.BytesIO(resp.content), sheet_name="STOCK")
     records = df.to_dict(orient="records")
 
     return [
@@ -384,7 +384,7 @@ async def sharepoint_excel_debug(item_id: str):
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
 
     xls = pd.ExcelFile(io.BytesIO(resp.content))
-    df_raw = pd.read_excel(xls, sheet_name="Stock", header=None, nrows=10)
+    df_raw = pd.read_excel(xls, sheet_name="STOCK", header=None, nrows=10)
     df_raw = df_raw.where(pd.notnull(df_raw), None)
 
     return {
